@@ -8,17 +8,283 @@ Description : Make a web app in streamlit for a warranty checker/monitoring with
 website     : serial-guard.streamlit.app
 """
 
-# import
-import database
-import ocr
-import streamlit as st
-import pandas as pd
+# ── Imports ──────────────────────────────────────────────────────────────────
+import re
 from datetime import date, datetime
+from typing import Iterable
+
+import numpy as np
+import pandas as pd
+import streamlit as st
+from PIL import Image
+from doctr.models import ocr_predictor
+from supabase import Client, create_client
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  DATABASE
+# ══════════════════════════════════════════════════════════════════════════════
+
+######################################
+############## Config ###############
+######################################
+
+# create the supabase client
+url = "https://nsbfvaghqvgdiiizclst.supabase.co"
+key = "sb_publishable_uN4WtLAtQWu3AoeTbKZQpA_USXH8wsM"
+supabase: Client = create_client(url, key)
+
+
+#######################################
+############## Devices ###############
+#######################################
+
+# delete one device by serial number
+def delete_device(serial_number):
+    respons = (
+        supabase.table("devices")
+        .delete()
+        .eq("serial_number", serial_number)
+        .execute()
+    )
+    return respons
+
+
+# add one device to the database
+def add_device(
+    name_val,
+    serial_val,
+    manufacturer,
+    assigned_user_str,
+    tags,
+    purchase_date,
+    warranty_period_val,
+):
+    data = {
+        "device_name": name_val,
+        "serial_number": serial_val,
+        "manufacturer": manufacturer,
+        "assigned_user": assigned_user_str,
+        "tags": tags,
+        "purchase_date": purchase_date.isoformat() if purchase_date else None,
+        "warranty_period": warranty_period_val,
+    }
+
+    response = supabase.table("devices").insert(data).execute()
+    return response
+
+
+# update one device with new values
+def update_device(
+    original_serial,
+    device_name,
+    serial_number,
+    manufacturer,
+    assigned_user,
+    tags,
+    purchase_date,
+    warranty_period,
+):
+    tags_val = tags if isinstance(tags, list) else [tags]
+
+    response = (
+        supabase.table("devices")
+        .update(
+            {
+                "device_name": device_name,
+                "serial_number": serial_number,
+                "manufacturer": manufacturer,
+                "assigned_user": assigned_user,
+                "tags": tags_val,
+                "purchase_date": str(purchase_date),  # supabase expects a string here
+                "warranty_period": warranty_period,
+            }
+        )
+        .eq("serial_number", original_serial)
+        .execute()
+    )
+
+    return response
+
+
+#####################################
+############## Users ###############
+#####################################
+
+# delete one user by name
+def delete_user(user_name):
+    respons = (
+        supabase.table("users")
+        .delete()
+        .eq("user_name", user_name)
+        .execute()
+    )
+    return respons
+
+
+# add a user if it does not exist
+def add_user(user_name):
+    data = {
+        "user_name": user_name
+    }
+
+    response = (
+        supabase
+        .table("users")
+        .upsert(data, on_conflict="user_name")  # add the user only once
+        .execute()
+    )
+
+    return response
+
+
+# get all user names
+def get_username():
+    response = (
+        supabase.table("users")
+        .select("*")
+        .execute()
+    )
+    usernames = [user["user_name"] for user in response.data]
+    return usernames
+
+
+######################################
+############## Search ###############
+######################################
+
+# search devices with words from many fields
+def search_devices(keywords: Iterable[str]):  # keywords can be a list or a tuple
+    # clean the keywords
+    words = [w.strip() for w in keywords if w and w.strip()]
+
+    response = supabase.table("devices").select(
+        "device_name, serial_number, manufacturer, assigned_user, tags, purchase_date, warranty_period"
+    ).execute()
+
+    devices = response.data or []
+
+    if not words:
+        return devices
+
+    def normalize(value):
+        return str(value).strip().lower()
+
+    def matches_word(device, word):
+        normalized_word = normalize(word)
+
+        searchable_values = [
+            device.get("device_name"),
+            device.get("serial_number"),
+            device.get("manufacturer"),
+            device.get("assigned_user"),
+        ]
+
+        if any(
+            normalized_word in normalize(value)
+            for value in searchable_values
+            if value is not None
+        ):
+            return True
+
+        device_tags = device.get("tags") or []
+        if not isinstance(device_tags, list):
+            device_tags = [device_tags]
+
+        return any(
+            normalized_word in normalize(tag)
+            for tag in device_tags
+            if tag is not None
+        )
+
+    return [
+        device for device in devices
+        if all(matches_word(device, word) for word in words)
+    ]
+
+
+######################################
+############## Stats ################
+######################################
+
+# count all devices
+def total_devices():
+    response = (
+        supabase
+        .table("devices")
+        .select("*", count="exact")
+        .execute()
+    )
+
+    return response.count
+
+
+# get all device names
+def all_devices_name():
+    response = (
+        supabase
+        .table("devices")
+        .select("device_name")
+        .execute()
+    )
+
+    return [device["device_name"] for device in response.data]
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  OCR
+# ══════════════════════════════════════════════════════════════════════════════
+
+#########################################
+############## Photo / OCR ##############
+#########################################
+
+# load the model into the cache to avoid loading for every click
+@st.cache_resource
+def load_model():
+    return ocr_predictor(
+        pretrained=True,
+        assume_straight_pages=False,
+        straighten_pages=True,
+        detect_orientation=True
+    )
+
+@st.dialog("OCR dialog")
+def ocr():
+    file = st.camera_input("take a picture") or st.file_uploader("upload a file here")
+
+    # a filter for dell serial number pattern (7 characters in uppercase, )
+    pattern = re.compile(r"[A-Z0-9]{7}")
+
+    if file is not None:
+        img = Image.open(file).convert("RGB")
+        img = np.array(img)
+
+        model = load_model()
+        result = model([img])
+
+        text = result.render()
+        glued_text = "".join(text.split())
+
+        matches = pattern.findall(glued_text)
+        valid_tags = [m for m in matches if re.search(r"[A-Z]", m)]
+
+        st.image(img)
+
+        if valid_tags:
+            st.success(f"Detected service tag: {valid_tags[0]}")
+        else:
+            st.warning("No service tag detected")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  MAIN APP
+# ══════════════════════════════════════════════════════════════════════════════
 
 # tests variables to simule datas
-users = sorted({user.strip() for user in database.get_username() if user and user.strip()})
-all_devices_name = database.all_devices_name()
-unique_devices_name = list(set(all_devices_name))
+users = sorted({user.strip() for user in get_username() if user and user.strip()})
+all_devices_name_list = all_devices_name()
+unique_devices_name = list(set(all_devices_name_list))
 #todo: export button ton csv with tags to for filtering, settings menu for default tags
 
 AUTH_PASSWORD = "Pa$$w0rd"
@@ -164,7 +430,7 @@ with st.container(border=True, horizontal=True, vertical_alignment="bottom"):
                 use_container_width=True,
                 disabled=not st.session_state.is_authenticated,
             ):
-                ocr.ocr()
+                ocr()
 
 if not st.session_state.is_authenticated:
     st.info("Read only mode. Login to scan, export, add, or modify devices.")
@@ -173,7 +439,7 @@ if not st.session_state.is_authenticated:
 ############## Status ##############
 ####################################
 
-all_status_items = database.search_devices([])
+all_status_items = search_devices([])
 status_counts = {
     "active": 0,
     "expiring_soon": 0,
@@ -245,7 +511,7 @@ with st.container(border=True, vertical_alignment="center"):
             accept_new_options=True,
         )
 
-    items = database.search_devices(search_options)
+    items = search_devices(search_options)
 
     if selected_status_filters:
         items = [
@@ -269,6 +535,7 @@ with st.container(border=True, vertical_alignment="center"):
 #########################################
 ############## Add devices ##############
 #########################################
+
 # open a dialog to add a device manually
 @st.dialog("Add a new device")
 def add_manually_device_dialog():
@@ -312,10 +579,10 @@ def add_manually_device_dialog():
 
                 # add user in the db
                 if assigned_user_str:
-                    database.add_user(assigned_user_str)
+                    add_user(assigned_user_str)
 
                 # call the function to add device if valid
-                database.add_device(
+                add_device(
                     name_val,
                     serial_val,
                     manufacturer,
@@ -330,7 +597,7 @@ def add_manually_device_dialog():
 with st.container(horizontal=True, horizontal_alignment="center", vertical_alignment="bottom"):
 
     # display the number of all devices
-    st.subheader(f"All devices ({database.total_devices()})")
+    st.subheader(f"All devices ({total_devices()})")
 
     # button to call the function
     if st.button("➕ Add Manually", disabled=not st.session_state.is_authenticated):
@@ -416,10 +683,10 @@ def modify_device_dialog(item):
             else:
                 # keep automatic add_user if needed
                 if assigned_user_val:
-                    database.add_user(assigned_user_val)
+                    add_user(assigned_user_val)
 
                 # this requires an update_device function in database.py
-                database.update_device(
+                update_device(
                     original_serial=item["serial_number"],
                     device_name=name_val,
                     serial_number=serial_val,
